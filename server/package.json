@@ -1,0 +1,41 @@
+{
+  "name": "cephei-serverless-server",
+  "version": "0.1.0",
+  "description": "Backend for Cephei Serverless — migrates containerized APIs to AWS Lambda.",
+  "type": "module",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node src/index.js",
+    "dev:memory": "node scripts/dev-with-memory-db.js",
+    "seed": "node scripts/seed-plans.js",
+    "promote-admin": "node scripts/promote-admin.js",
+    "migrate-project-owners": "node scripts/migrate-project-owners.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewayv2": "^3.699.0",
+    "@aws-sdk/client-cloudwatch": "^3.1137.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.699.0",
+    "@aws-sdk/client-codebuild": "^3.699.0",
+    "@aws-sdk/client-ecr": "^3.699.0",
+    "@aws-sdk/client-lambda": "^3.699.0",
+    "@aws-sdk/client-s3": "^3.699.0",
+    "@aws-sdk/client-secrets-manager": "^3.699.0",
+    "@aws-sdk/client-sts": "^3.699.0",
+    "@aws-sdk/credential-providers": "^3.699.0",
+    "archiver": "^7.0.1",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.4.1",
+    "razorpay": "^2.9.4",
+    "tar": "^7.4.3"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^9.2.0"
+  }
+}
