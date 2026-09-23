@@ -1,36 +1,24 @@
 import * as aws from './aws/deploy.js';
+import * as azure from './azure/deploy.js';
+import * as gcp from './gcp/deploy.js';
 
-class ProviderNotImplementedError extends Error {
+class UnknownProviderError extends Error {
   constructor(provider) {
-    super(`The ${provider} provider isn't wired up to real infrastructure yet.`);
-    this.name = 'ProviderNotImplementedError';
-    this.status = 501;
+    super(`'${provider}' isn't a supported deploy provider.`);
+    this.name = 'UnknownProviderError';
+    this.status = 400;
   }
 }
 
-function notImplemented(provider) {
-  return new Proxy(
-    {},
-    {
-      get() {
-        return () => {
-          throw new ProviderNotImplementedError(provider);
-        };
-      },
-    }
-  );
-}
-
-const PROVIDERS = {
-  aws,
-  azure: notImplemented('azure'),
-  gcp: notImplemented('gcp'),
-};
+// All three real: aws (§4.1), azure (§4.2), gcp (§4.3) — each implements
+// the same deployBackend/rollback/verifyConnection/getMetrics contract
+// against its own cloud's real SDKs. No simulated/stub provider remains.
+const PROVIDERS = { aws, azure, gcp };
 
 export function getProvider(providerKey) {
   const provider = PROVIDERS[providerKey];
   if (!provider) {
-    throw new ProviderNotImplementedError(providerKey || '(none)');
+    throw new UnknownProviderError(providerKey || '(none)');
   }
   return provider;
 }

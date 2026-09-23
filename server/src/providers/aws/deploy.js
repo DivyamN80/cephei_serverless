@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { GetCallerIdentityCommand } from '@aws-sdk/client-sts';
-import { downloadRepoSource } from '../../services/repoIngest.js';
+import { downloadRepoSource, resolveProjectGithubAuth, resolveBackendCandidate } from '../../services/repoIngest.js';
 import { generateDockerfile } from './dockerfile.js';
 import { buildClients, assumeAndVerify, AwsProviderError } from './clients.js';
 import { ensureEcrRepo, ensureLambdaCanPullFromEcr, buildAndPushImage } from './build.js';
@@ -44,8 +44,8 @@ function resolveExecutionRoleArn(account, accountId) {
 }
 
 async function prepareBuildSource(project) {
-  const { dir } = await downloadRepoSource(project.repoUrl);
-  const candidate = project.backendCandidates?.[0];
+  const { dir } = await downloadRepoSource(project.repoUrl, resolveProjectGithubAuth(project));
+  const candidate = resolveBackendCandidate(project);
   const sourceDir = candidate?.path && candidate.path !== '.' ? path.join(dir, candidate.path) : dir;
 
   const pkgPath = path.join(sourceDir, 'package.json');
@@ -57,7 +57,7 @@ async function prepareBuildSource(project) {
     .then(() => true)
     .catch(() => false);
   if (!hasDockerfile) {
-    await fs.writeFile(dockerfilePath, generateDockerfile(pkg));
+    await fs.writeFile(dockerfilePath, generateDockerfile(pkg, { listenPort: candidate?.listenPort ?? 3000 }));
   }
 
   return { extractedRoot: dir, sourceDir };
@@ -106,7 +106,13 @@ export async function deployBackend(project, account, secrets, onLog) {
 
     const fn = await ensureLambdaFunction(
       clients.lambda,
-      { functionName, imageUri, role: executionRoleArn, environment: secrets || {} },
+      {
+        functionName,
+        imageUri,
+        role: executionRoleArn,
+        environment: secrets || {},
+        vpcConfig: account?.lambdaVpc?.subnetIds?.length ? account.lambdaVpc : undefined,
+      },
       onLog
     );
 

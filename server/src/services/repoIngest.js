@@ -3,9 +3,11 @@ import fssync from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { spawn } from 'child_process';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import * as tar from 'tar';
+import { decryptSecretValue } from '../utils/secretsCrypto.js';
 
 const GITHUB_API = 'https://api.github.com';
 const CODELOAD = 'https://codeload.github.com';
@@ -68,28 +70,37 @@ export function parseGithubUrl(repoUrl) {
   return { owner, repo, branch };
 }
 
-function githubHeaders(extra = {}) {
+// token, when given, is a per-project PAT (already decrypted by the
+// caller) and takes priority over the server-wide process.env.GITHUB_TOKEN
+// fallback used for unauthenticated/public lookups.
+function githubHeaders(extra = {}, token) {
   const headers = { 'User-Agent': USER_AGENT, Accept: 'application/vnd.github+json', ...extra };
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const auth = token || process.env.GITHUB_TOKEN;
+  if (auth) {
+    headers.Authorization = `Bearer ${auth}`;
   }
   return headers;
 }
 
-async function fetchRepoMetadata(owner, repo) {
+async function fetchRepoMetadata(owner, repo, token) {
   let res;
   try {
     res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, {
-      headers: githubHeaders(),
+      headers: githubHeaders({}, token),
       signal: AbortSignal.timeout(15_000),
     });
   } catch (err) {
     throw new RepoIngestError(`Could not reach GitHub to look up ${owner}/${repo}: ${err.message}`, 502);
   }
 
+  if (res.status === 401) {
+    throw new RepoIngestError('GitHub rejected the provided personal access token.');
+  }
   if (res.status === 404) {
     throw new RepoIngestError(
-      `GitHub repo ${owner}/${repo} was not found. Check the URL and make sure the repository is public.`
+      token
+        ? `GitHub repo ${owner}/${repo} was not found, or this token does not have access to it.`
+        : `GitHub repo ${owner}/${repo} was not found. If it's private, connect a GitHub credential for this project.`
     );
   }
   if (res.status === 403) {
@@ -99,24 +110,44 @@ async function fetchRepoMetadata(owner, repo) {
     throw new RepoIngestError(`GitHub API returned ${res.status} while looking up ${owner}/${repo}.`, 502);
   }
 
-  const data = await res.json();
-  if (data.private) {
-    throw new RepoIngestError('This repository is private. Only public GitHub repositories are supported right now.');
-  }
-  return data;
+  return res.json();
+}
+
+// Unauthenticated lookup used only to distinguish "doesn't exist" from
+// "exists but is private" after an unauthenticated fetchRepoMetadata call
+// has already failed — lets the caller ask for a credential instead of
+// dead-ending on a generic 404.
+export async function probeIsPrivate(owner, repo) {
+  const res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, {
+    headers: githubHeaders(),
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  if (!res) return true; // network failure — safer to ask for a credential than guess
+  if (res.ok) return false;
+  if (res.status === 404) return true;
+  return false;
 }
 
 // Downloads the repo tarball (no git binary required) and extracts it into
 // a fresh scratch directory under the OS temp dir, stripping the single
-// "<repo>-<branch>/" top-level folder codeload tarballs are wrapped in.
-async function downloadAndExtract(owner, repo, branch) {
+// "<repo>-<branch>/" top-level folder the tarball is wrapped in. With a
+// token, downloads via GitHub's authenticated tarball endpoint instead of
+// public codeload.github.com, which doesn't accept auth headers for
+// private repos.
+async function downloadAndExtract(owner, repo, branch, token) {
   const dest = path.join(os.tmpdir(), `cephei-ingest-${crypto.randomBytes(8).toString('hex')}`);
   await fs.mkdir(dest, { recursive: true });
 
-  const url = `${CODELOAD}/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(branch)}`;
+  const url = token
+    ? `${GITHUB_API}/repos/${owner}/${repo}/tarball/${encodeURIComponent(branch)}`
+    : `${CODELOAD}/${owner}/${repo}/tar.gz/refs/heads/${encodeURIComponent(branch)}`;
   let res;
   try {
-    res = await fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(60_000) });
+    res = await fetch(url, {
+      headers: token ? githubHeaders({}, token) : { 'User-Agent': USER_AGENT },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(60_000),
+    });
   } catch (err) {
     await fs.rm(dest, { recursive: true, force: true });
     throw new RepoIngestError(`Could not download ${owner}/${repo}@${branch}: ${err.message}`, 502);
@@ -138,6 +169,120 @@ async function downloadAndExtract(owner, repo, branch) {
   }
 
   return dest;
+}
+
+// Runs `git`, relaying stdout/stderr-derived context only through the
+// rejection message (never resolving/rejecting with raw output verbatim
+// beyond a truncated tail) so a failure is diagnosable without risking a
+// stray echo of the SSH key itself, which git/ssh error text never
+// includes but which this keeps well clear of regardless.
+function runGit(args, { env }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { env });
+    let stdout = '';
+    let stderrTail = '';
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-2000);
+    });
+    child.on('error', (err) => {
+      reject(
+        new RepoIngestError(`Could not run git: ${err.message}. Is the git binary installed on this server?`, 502)
+      );
+    });
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new RepoIngestError(`git ${args[0]} failed (exit ${code}): ${stderrTail.trim().slice(-500)}`, 502));
+    });
+  });
+}
+
+// Clones a private repo over SSH using a deploy key — the path for repos
+// where the customer added a Cephei-generated (or their own) deploy key
+// under Settings → Deploy keys instead of issuing a PAT. Requires the git
+// binary to be present on whatever host runs this server, the same way
+// Docker already is one for build.js's local-build fallback.
+async function downloadViaSsh({ owner, repo, branch, sshKey }) {
+  const dest = path.join(os.tmpdir(), `cephei-ingest-${crypto.randomBytes(8).toString('hex')}`);
+  const keyDir = path.join(os.tmpdir(), `cephei-sshkey-${crypto.randomBytes(8).toString('hex')}`);
+  const keyPath = path.join(keyDir, 'deploy_key');
+  const remote = `git@github.com:${owner}/${repo}.git`;
+
+  await fs.mkdir(keyDir, { recursive: true, mode: 0o700 });
+  try {
+    const keyText = sshKey.endsWith('\n') ? sshKey : `${sshKey}\n`;
+    await fs.writeFile(keyPath, keyText, { mode: 0o600 });
+    await fs.chmod(keyPath, 0o600);
+
+    const env = {
+      ...process.env,
+      GIT_SSH_COMMAND: `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes`,
+      GIT_TERMINAL_PROMPT: '0',
+    };
+
+    let resolvedBranch = branch;
+    if (!resolvedBranch) {
+      const out = await runGit(['ls-remote', '--symref', remote, 'HEAD'], { env });
+      resolvedBranch = out.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m)?.[1] || 'main';
+    }
+
+    try {
+      await runGit(
+        ['clone', '--depth', '1', '--branch', resolvedBranch, '--single-branch', remote, dest],
+        { env }
+      );
+    } catch (err) {
+      await fs.rm(dest, { recursive: true, force: true });
+      throw err;
+    }
+
+    return { dir: dest, branch: resolvedBranch };
+  } finally {
+    await fs.rm(keyDir, { recursive: true, force: true });
+  }
+}
+
+// Resolves repoUrl + an optional decrypted githubAuth ({ method, token })
+// down to an extracted source directory + the branch that was used —
+// shared by analyzeRepo and downloadRepoSource so the PAT/SSH/public
+// routing logic lives in exactly one place. githubAuth undefined/null
+// means "public repo," same as before this credential support existed.
+async function resolveSource(owner, repo, branchOverride, githubAuth) {
+  if (githubAuth?.method === 'ssh') {
+    const { dir, branch } = await downloadViaSsh({ owner, repo, branch: branchOverride, sshKey: githubAuth.token });
+    return { dir, branch };
+  }
+  const token = githubAuth?.method === 'pat' ? githubAuth.token : undefined;
+  const meta = await fetchRepoMetadata(owner, repo, token);
+  const branch = branchOverride || meta.default_branch;
+  const dir = await downloadAndExtract(owner, repo, branch, token);
+  return { dir, branch };
+}
+
+// Turns a Project document's encrypted githubAuth sub-document into the
+// { method, token } shape resolveSource/analyzeRepo/downloadRepoSource
+// expect — shared by every provider's prepareBuildSource() so the decrypt
+// call isn't copy-pasted into aws/azure/gcp deploy.js separately.
+export function resolveProjectGithubAuth(project) {
+  if (!project?.githubAuth?.method) return undefined;
+  return { method: project.githubAuth.method, token: decryptSecretValue(project.githubAuth) };
+}
+
+// Picks the backend candidate to actually build/deploy: the one the
+// customer explicitly chose via POST /:id/select-backend for a monorepo
+// (multiple candidates), falling back to the first one detected — the same
+// "first candidate wins" default every provider's prepareBuildSource() used
+// before an explicit selection existed. Shared here so all three providers
+// (and the dockerfile-preview route) resolve it identically.
+export function resolveBackendCandidate(project) {
+  const candidates = project?.backendCandidates || [];
+  if (project?.selectedBackendPath) {
+    const selected = candidates.find((c) => c.path === project.selectedBackendPath);
+    if (selected) return selected;
+  }
+  return candidates[0];
 }
 
 async function findPackageJsonFiles(root, maxDepth = MAX_PACKAGE_JSON_DEPTH) {
@@ -193,6 +338,34 @@ function detectDatabase(deps) {
   if (deps.mongoose) return 'mongodb';
   if (deps.mysql2 || deps.mysql) return 'mysql';
   if (deps['@nestjs/typeorm'] || deps.typeorm) return 'postgres';
+  return null;
+}
+
+// Matches app.listen(4000), app.listen(process.env.PORT || 3000), and the
+// ?? variant — the numeric literal is what the app actually binds to when
+// no PORT env var is set, which is exactly the case that silently breaks
+// deploys generated with a hardcoded ENV PORT the app never reads.
+const LISTEN_PORT_REGEX = /\.listen\(\s*(?:process\.env\.\w+\s*(?:\?\?|\|\|)\s*)?(\d{2,5})/;
+
+// Best-effort port detection: greps every source file under a single
+// candidate's own directory (not the whole repo — a monorepo's other
+// packages may call .listen() on an unrelated port) and returns the first
+// numeric match, or null if nothing matched so the caller can fall back to
+// a documented default instead of silently guessing wrong.
+async function detectListenPort(dir) {
+  const files = await collectSourceFiles(dir);
+  for (const file of files) {
+    let content;
+    try {
+      const stat = await fs.stat(file);
+      if (stat.size > MAX_FILE_SIZE_BYTES) continue;
+      content = await fs.readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const match = content.match(LISTEN_PORT_REGEX);
+    if (match) return Number(match[1]);
+  }
   return null;
 }
 
@@ -296,24 +469,24 @@ async function scanForCompatibilityIssues(root) {
 // directory — used at deploy time (a separate request, possibly a
 // separate server process, from the one that ran analyzeRepo) rather than
 // assuming an earlier extraction still exists. Caller owns cleanup of the
-// returned directory.
-export async function downloadRepoSource(repoUrl) {
+// returned directory. githubAuth is the already-decrypted { method, token }
+// credential (see resolveProjectGithubAuth) — omitted for public repos.
+export async function downloadRepoSource(repoUrl, githubAuth) {
   const { owner, repo, branch: branchOverride } = parseGithubUrl(repoUrl);
-  const meta = await fetchRepoMetadata(owner, repo);
-  const branch = branchOverride || meta.default_branch;
-  const dir = await downloadAndExtract(owner, repo, branch);
+  const { dir, branch } = await resolveSource(owner, repo, branchOverride, githubAuth);
   return { dir, owner, repo, branch };
 }
 
-// Real replacement for simulateStackDetection(): clones (via tarball, no
-// git binary needed) and inspects the actual repo pointed at by repoUrl,
-// instead of returning the same hardcoded NestJS/React/Postgres result for
-// every project.
-export async function analyzeRepo(repoUrl) {
+// Real replacement for simulateStackDetection(): clones (via tarball for
+// public/PAT repos, no git binary needed there; via `git clone` over SSH
+// for deploy-key repos) and inspects the actual repo pointed at by
+// repoUrl, instead of returning the same hardcoded NestJS/React/Postgres
+// result for every project. githubAuth is the already-decrypted
+// { method, token } credential — omitted/undefined means "public repo,"
+// exactly as before private-repo support existed.
+export async function analyzeRepo(repoUrl, githubAuth) {
   const { owner, repo, branch: branchOverride } = parseGithubUrl(repoUrl);
-  const meta = await fetchRepoMetadata(owner, repo);
-  const branch = branchOverride || meta.default_branch;
-  const dest = await downloadAndExtract(owner, repo, branch);
+  const { dir: dest } = await resolveSource(owner, repo, branchOverride, githubAuth);
 
   try {
     const pkgPaths = await findPackageJsonFiles(dest);
@@ -344,6 +517,7 @@ export async function analyzeRepo(repoUrl) {
       const frontend = detectFramework(deps, FRONTEND_FRAMEWORKS);
       const dir = path.dirname(pkgPath);
       const relDir = path.relative(dest, dir).split(path.sep).join('/') || '.';
+      const detectedPort = await detectListenPort(dir);
 
       candidates.push({
         path: relDir,
@@ -353,6 +527,12 @@ export async function analyzeRepo(repoUrl) {
         database: detectDatabase(deps),
         node: pkg.engines?.node || null,
         hasDockerfile: fssync.existsSync(path.join(dir, 'Dockerfile')),
+        // Node/Express/NestJS's conventional default when nothing matched
+        // — listenPortDetected tells the caller whether that's a real
+        // finding or just a guess, so a wrong guess can be surfaced to the
+        // customer instead of silently baked into the Dockerfile.
+        listenPort: detectedPort ?? 3000,
+        listenPortDetected: detectedPort !== null,
       });
     }
 
@@ -414,6 +594,8 @@ export async function analyzeRepo(repoUrl) {
         framework: c.backend.name,
         database: c.database,
         hasDockerfile: c.hasDockerfile,
+        listenPort: c.listenPort,
+        listenPortDetected: c.listenPortDetected,
       })),
     };
   } finally {

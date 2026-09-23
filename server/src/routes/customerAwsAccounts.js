@@ -5,6 +5,7 @@ import Project from '../models/Project.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getProvider } from '../providers/index.js';
 import { encryptSecretValue } from '../utils/secretsCrypto.js';
+import { buildDeployRoleTemplate, summarizeAwsPermissions } from '../providers/aws/cfnTemplate.js';
 
 const router = express.Router();
 
@@ -12,15 +13,22 @@ router.use(requireAuth);
 
 const PROVIDERS = ['aws', 'azure', 'gcp'];
 
-// SIMULATED — per-provider onboarding info. A real implementation would:
-//  - aws:   publish a CloudFormation template (cfnTemplate.js) and build a
-//           real "Quick create stack" console URL with the externalId
-//           pre-filled as a stack parameter.
-//  - azure: publish an ARM/Bicep template and build a real Azure "Deploy to
-//           Azure" custom-deployment URL, again carrying the externalId.
-//  - gcp:   publish a Deployment Manager / Terraform config and build a
-//           real Cloud Shell "walkthrough" URL that provisions the scoped
-//           service account, again carrying the externalId.
+// Per-provider onboarding info.
+//  - aws:   real — builds an actual CloudFormation template (cfnTemplate.js)
+//           scoped to exactly what providers/aws/*.js calls. No
+//           quickCreateUrl: that requires a publicly-fetchable templateURL,
+//           which needs an S3 (or equivalent) publish step this doesn't
+//           have — templateBody carries the real JSON instead, for a
+//           copy/paste or upload-a-file flow in the console, alongside the
+//           externalId shown separately in the UI to paste into the stack's
+//           ExternalId parameter.
+//  - azure: SIMULATED — a real implementation would publish an ARM/Bicep
+//           template and build a real Azure "Deploy to Azure"
+//           custom-deployment URL, again carrying the externalId.
+//  - gcp:   SIMULATED — a real implementation would publish a Deployment
+//           Manager / Terraform config and build a real Cloud Shell
+//           "walkthrough" URL that provisions the scoped service account,
+//           again carrying the externalId.
 function buildProviderOnboarding(provider, externalId) {
   if (provider === 'azure') {
     return {
@@ -58,21 +66,17 @@ function buildProviderOnboarding(provider, externalId) {
       ],
     };
   }
-  // aws (default)
+  // aws (default) — real template, scoped to exactly what
+  // providers/aws/*.js calls (ECR, CodeBuild, Lambda, API Gateway, a
+  // PassRole scoped to the two roles the template itself creates, and
+  // Secrets Manager).
+  const templateBody = buildDeployRoleTemplate({
+    vendorAccountId: process.env.AWS_ACCOUNT_ID,
+    externalId,
+  });
   return {
-    // No quickCreateUrl yet — the CloudFormation template isn't published.
-    // Until it is, customers create the IAM role manually (see permissions
-    // below) and paste the resulting ARNs into the connect form.
-    permissions: [
-      'Push container images to ECR (cephei-* repositories only)',
-      'Build container images via CodeBuild (cephei-* projects only) — no Docker daemon required on our side',
-      'Create and update Lambda functions, publish versions, and manage the `live` alias (cephei-* function names only)',
-      'Manage API Gateway HTTP APIs for deployed functions',
-      'A single scoped iam:PassRole limited to the Lambda execution role Cephei creates',
-      'Read-only CloudWatch metrics and logs for deployed functions',
-      'Read-only AWS Cost Explorer access for cost reporting',
-      'Bootstrap an RDS instance/connection when a database migration is requested',
-    ],
+    templateBody,
+    permissions: summarizeAwsPermissions(),
   };
 }
 
@@ -103,9 +107,9 @@ router.post('/', async (req, res, next) => {
       status: 'pending',
     });
 
-    const { quickCreateUrl, permissions, consoleLabel } = buildProviderOnboarding(provider, externalId);
+    const { quickCreateUrl, templateBody, permissions, consoleLabel } = buildProviderOnboarding(provider, externalId);
 
-    res.status(201).json({ account, quickCreateUrl, permissions, consoleLabel });
+    res.status(201).json({ account, quickCreateUrl, templateBody, permissions, consoleLabel });
   } catch (err) {
     next(err);
   }
@@ -212,6 +216,57 @@ router.post('/:id/verify', async (req, res, next) => {
     if (!account.connectedAt) {
       account.connectedAt = new Date();
     }
+    await account.save();
+
+    res.json(account);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const SUBNET_ID_PATTERN = /^subnet-[0-9a-f]{8,}$/i;
+const SECURITY_GROUP_ID_PATTERN = /^sg-[0-9a-f]{8,}$/i;
+
+// Updates only the optional Lambda VPC placement for an AWS account —
+// subnet/security-group IDs the customer supplies directly (Cephei never
+// discovers or validates them against the account itself, so this needs no
+// new EC2 permissions on the deploy role; see cfnTemplate.js). Sending both
+// fields empty clears lambdaVpc, reverting the account to the
+// public-network-path-only behavior every account had before this existed.
+router.patch('/:id', async (req, res, next) => {
+  try {
+    const account = await CustomerAwsAccount.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!account) {
+      return res.status(404).json({ error: 'Cloud account not found' });
+    }
+    if (account.provider !== 'aws') {
+      return res.status(400).json({ error: 'lambdaVpc only applies to AWS accounts' });
+    }
+
+    const { subnetIds, securityGroupIds } = req.body || {};
+    if (subnetIds !== undefined && !Array.isArray(subnetIds)) {
+      return res.status(400).json({ error: 'subnetIds must be an array of strings' });
+    }
+    if (securityGroupIds !== undefined && !Array.isArray(securityGroupIds)) {
+      return res.status(400).json({ error: 'securityGroupIds must be an array of strings' });
+    }
+
+    const cleanSubnetIds = (subnetIds || []).map((s) => String(s).trim()).filter(Boolean);
+    const cleanSecurityGroupIds = (securityGroupIds || []).map((s) => String(s).trim()).filter(Boolean);
+
+    const badSubnet = cleanSubnetIds.find((s) => !SUBNET_ID_PATTERN.test(s));
+    if (badSubnet) {
+      return res.status(400).json({ error: `"${badSubnet}" doesn't look like a subnet ID (expected subnet-xxxxxxxx)` });
+    }
+    const badSecurityGroup = cleanSecurityGroupIds.find((s) => !SECURITY_GROUP_ID_PATTERN.test(s));
+    if (badSecurityGroup) {
+      return res.status(400).json({ error: `"${badSecurityGroup}" doesn't look like a security group ID (expected sg-xxxxxxxx)` });
+    }
+
+    account.lambdaVpc =
+      cleanSubnetIds.length || cleanSecurityGroupIds.length
+        ? { subnetIds: cleanSubnetIds, securityGroupIds: cleanSecurityGroupIds }
+        : undefined;
     await account.save();
 
     res.json(account);

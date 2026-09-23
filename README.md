@@ -76,6 +76,7 @@ deploy-history persistence (`DeployLog`), the rollback endpoint's version-tracki
 the entire React UI against this API contract.
 
 **Simulated** (search each file for `// SIMULATED` to find every instance):
+
 - `POST /api/projects` — stack detection and compatibility checklist are canned, not a real
   repo clone/scan.
 - `POST /api/projects/:id/traffic-tier` — the recommendation + diff preview are canned.
@@ -102,7 +103,7 @@ narrow and intentional:
    connect/verify handlers with your real `customerAwsClients.js`'s `verifyConnection`.
 3. `server/src/services/metricsService.js` — replace the `cost`/`metrics` simulation with real
    `cloudwatch.send(new GetMetricDataCommand(...))` / `costexplorer.send(new
-   GetCostAndUsageCommand(...))` calls via `buildCustomerClients(customerAwsAccount, ...)`.
+GetCostAndUsageCommand(...))` calls via `buildCustomerClients(customerAwsAccount, ...)`.
 4. Apply the IAM policy additions from your project doc's §7 (`Monitoring` and
    `LambdaVersioningForRollback` statements) to `cfnTemplate.js`'s `buildDeployRoleTemplate`,
    and the alias-based rollback change to `awsDeployer.js` (§5.5 of the same doc) — the

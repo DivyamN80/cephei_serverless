@@ -14,7 +14,12 @@ import {
 const LIVE_ALIAS = 'live';
 const WAITER_OPTS = { maxWaitTime: 180 };
 
-export async function ensureLambdaFunction(lambda, { functionName, imageUri, role, environment }, onLog) {
+// vpcConfig ({ subnetIds, securityGroupIds }) is optional — the customer's
+// CustomerAwsAccount.lambdaVpc, when set. Without it (the default), the
+// function gets no VpcConfig at all, same as before this option existed —
+// only needed when the database (or anything else the function calls)
+// isn't reachable over the public internet.
+export async function ensureLambdaFunction(lambda, { functionName, imageUri, role, environment, vpcConfig }, onLog) {
   let exists = true;
   try {
     await lambda.send(new GetFunctionCommand({ FunctionName: functionName }));
@@ -22,6 +27,10 @@ export async function ensureLambdaFunction(lambda, { functionName, imageUri, rol
     if (err.name !== 'ResourceNotFoundException') throw err;
     exists = false;
   }
+
+  const VpcConfig = vpcConfig
+    ? { SubnetIds: vpcConfig.subnetIds, SecurityGroupIds: vpcConfig.securityGroupIds }
+    : undefined;
 
   if (!exists) {
     onLog(`Creating Lambda function ${functionName}...`);
@@ -34,6 +43,7 @@ export async function ensureLambdaFunction(lambda, { functionName, imageUri, rol
         Timeout: 29, // API Gateway HTTP API's own hard integration timeout is 30s
         MemorySize: 512,
         Environment: { Variables: environment },
+        ...(VpcConfig ? { VpcConfig } : {}),
       })
     );
     await waitUntilFunctionActiveV2({ client: lambda, ...WAITER_OPTS }, { FunctionName: functionName });
@@ -46,6 +56,7 @@ export async function ensureLambdaFunction(lambda, { functionName, imageUri, rol
       new UpdateFunctionConfigurationCommand({
         FunctionName: functionName,
         Environment: { Variables: environment },
+        ...(VpcConfig ? { VpcConfig } : {}),
       })
     );
     await waitUntilFunctionUpdatedV2({ client: lambda, ...WAITER_OPTS }, { FunctionName: functionName });

@@ -1,5 +1,7 @@
 import express from 'express';
 import crypto from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
 import Project from '../models/Project.js';
 import DeployLog from '../models/DeployLog.js';
 import CustomerAwsAccount from '../models/CustomerAwsAccount.js';
@@ -8,9 +10,18 @@ import ProjectSecret from '../models/ProjectSecret.js';
 import { requireAuth, requireActiveSubscription } from '../middleware/auth.js';
 import { getDashboard } from '../services/metricsService.js';
 import { encryptSecretValue, maskedPreview } from '../utils/secretsCrypto.js';
-import { analyzeRepo, RepoIngestError } from '../services/repoIngest.js';
+import {
+  analyzeRepo,
+  parseGithubUrl,
+  probeIsPrivate,
+  downloadRepoSource,
+  resolveProjectGithubAuth,
+  resolveBackendCandidate,
+  RepoIngestError,
+} from '../services/repoIngest.js';
 import { loadProjectSecretsPlaintext } from '../services/secretSync.js';
 import { getProvider } from '../providers/index.js';
+import { generateDockerfile } from '../providers/aws/dockerfile.js';
 
 const router = express.Router();
 
@@ -334,18 +345,158 @@ router.post('/', async (req, res, next) => {
       await project.save();
       res.status(201).json(project);
     } catch (analysisErr) {
-      // Don't leave a broken, permanently-'analyzing' project sitting in
-      // the account (and consuming a project-limit slot) when the repo
-      // couldn't actually be analyzed — the client has no UI yet for a
-      // failed project, so surface this as a request error instead.
+      if (analysisErr instanceof RepoIngestError) {
+        // A private repo can't be analyzed without a credential — rather
+        // than deleting the project and dead-ending with a generic error,
+        // check whether that's actually why analysis failed and, if so,
+        // keep the project around (still 'analyzing', no detectedStack
+        // yet) so the client can collect a PAT/SSH key via
+        // POST /:id/github-auth instead.
+        let isPrivate = false;
+        try {
+          const { owner, repo } = parseGithubUrl(repoUrl);
+          isPrivate = await probeIsPrivate(owner, repo);
+        } catch {
+          // Malformed URL or probe failure — fall through to the generic
+          // error response below, same as before private-repo support.
+        }
+        if (isPrivate) {
+          return res.status(201).json({ project, needsGithubCredential: true });
+        }
+
+        // Don't leave a broken, permanently-'analyzing' project sitting in
+        // the account (and consuming a project-limit slot) when the repo
+        // couldn't actually be analyzed — the client has no UI yet for a
+        // failed project, so surface this as a request error instead.
+        await Project.deleteOne({ _id: project._id });
+        return res.status(analysisErr.status).json({ error: analysisErr.message });
+      }
       await Project.deleteOne({ _id: project._id });
+      throw analysisErr;
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Attaches a GitHub credential (PAT or SSH deploy key) to a project that
+// couldn't be analyzed as a public repo, then immediately re-runs analysis
+// with it so a bad token/key fails fast here rather than only being
+// discovered at the next deploy. Nothing is persisted unless analysis
+// actually succeeds with this credential.
+router.post('/:id/github-auth', async (req, res, next) => {
+  try {
+    const { method, credential } = req.body || {};
+    if (method !== 'pat' && method !== 'ssh') {
+      return res.status(400).json({ error: "method must be 'pat' or 'ssh'" });
+    }
+    if (typeof credential !== 'string' || !credential.trim()) {
+      return res.status(400).json({ error: 'credential is required' });
+    }
+
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    let analysis;
+    try {
+      analysis = await analyzeRepo(project.repoUrl, { method, token: credential });
+    } catch (analysisErr) {
       if (analysisErr instanceof RepoIngestError) {
         return res.status(analysisErr.status).json({ error: analysisErr.message });
       }
       throw analysisErr;
     }
+
+    const { ciphertext, iv, authTag } = encryptSecretValue(credential);
+    project.githubAuth = { method, ciphertext, iv, authTag };
+    project.detectedStack = analysis.detectedStack;
+    project.compatibilityChecklist = analysis.compatibilityChecklist;
+    project.backendCandidates = analysis.backendCandidates;
+    project.status = 'ready';
+    await project.save();
+
+    res.json(project);
   } catch (err) {
     next(err);
+  }
+});
+
+// Lets the customer pick which backendCandidates[] entry actually gets
+// built/deployed when analyzeRepo() found more than one (a monorepo) —
+// every provider's prepareBuildSource() resolves the deploy target via
+// resolveBackendCandidate(project), which prefers this over candidates[0].
+router.post('/:id/select-backend', async (req, res, next) => {
+  try {
+    const { path: backendPath } = req.body || {};
+    if (typeof backendPath !== 'string' || !backendPath) {
+      return res.status(400).json({ error: 'path is required' });
+    }
+
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const candidatePaths = (project.backendCandidates || []).map((c) => c.path);
+    if (!candidatePaths.includes(backendPath)) {
+      return res.status(400).json({
+        error: `path must be one of this project's backendCandidates (${candidatePaths.join(', ') || 'none'})`,
+      });
+    }
+
+    project.selectedBackendPath = backendPath;
+    await project.save();
+
+    res.json(project);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Read-only preview of the Dockerfile the deploy path would actually use —
+// same generateDockerfile(pkg, { listenPort }) call prepareBuildSource()
+// (providers/aws/deploy.js) makes, but without writing anything or running
+// a build. Re-downloads the repo source purely to read package.json (and
+// the candidate's own Dockerfile, if any) and discards it immediately.
+router.get('/:id/dockerfile-preview', async (req, res, next) => {
+  let dir;
+  try {
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    const candidate = resolveBackendCandidate(project);
+    if (!candidate) {
+      return res.status(400).json({
+        error: 'No backend was detected for this project — re-run repo analysis before previewing a Dockerfile',
+      });
+    }
+
+    ({ dir } = await downloadRepoSource(project.repoUrl, resolveProjectGithubAuth(project)));
+    const sourceDir = candidate.path && candidate.path !== '.' ? path.join(dir, candidate.path) : dir;
+
+    const pkg = JSON.parse(await fs.readFile(path.join(sourceDir, 'package.json'), 'utf8'));
+    const generated = generateDockerfile(pkg, { listenPort: candidate.listenPort ?? 3000 });
+
+    const existing = await fs
+      .readFile(path.join(sourceDir, 'Dockerfile'), 'utf8')
+      .catch(() => null);
+
+    if (existing !== null) {
+      // The repo's own Dockerfile is what deploy actually uses unmodified
+      // (see prepareBuildSource's `if (!hasDockerfile)` guard) — `dockerfile`
+      // here is what Cephei *would* generate, returned alongside the real
+      // one purely so the client can diff them for the customer's own review.
+      res.json({ dockerfile: generated, wasGenerated: false, existingDockerfile: existing });
+    } else {
+      res.json({ dockerfile: generated, wasGenerated: true });
+    }
+  } catch (err) {
+    next(err);
+  } finally {
+    if (dir) await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -505,8 +656,28 @@ router.post('/:id/deploy', requireActiveSubscription, async (req, res, next) => 
       log: [],
     });
 
+    // Streamed as Server-Sent Events so the client can render each log line
+    // as it happens instead of showing a spinner for the couple of minutes
+    // a CodeBuild-based deploy can take. DeployLog.log is still built up in
+    // memory exactly as before and saved once at the end, so /deploy-logs
+    // and a page refresh keep working unchanged.
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    // A client that navigates away mid-deploy closes the socket; the deploy
+    // itself keeps running server-side, but writes to the now-dead response
+    // must not crash the process.
+    res.on('error', () => {});
+
+    const sendEvent = (payload) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
     const onLog = (line) => {
       deployLog.log.push({ ts: new Date(), line });
+      sendEvent({ line });
     };
 
     try {
@@ -530,14 +701,16 @@ router.post('/:id/deploy', requireActiveSubscription, async (req, res, next) => 
       project.status = 'deployed';
       await project.save();
 
-      res.json({ project, deployLog });
+      sendEvent({ done: true, project, deployLog });
     } catch (deployErr) {
       deployLog.status = 'failed';
       deployLog.error = deployErr.message;
       deployLog.finishedAt = new Date();
       await deployLog.save();
 
-      res.status(deployErr.status || 500).json({ error: deployErr.message, deployLog });
+      sendEvent({ done: true, error: deployErr.message, deployLog });
+    } finally {
+      res.end();
     }
   } catch (err) {
     next(err);

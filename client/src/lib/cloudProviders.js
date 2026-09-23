@@ -51,3 +51,18 @@ export const CLOUD_PROVIDERS = [
 export function providerMeta(key) {
   return CLOUD_PROVIDERS.find((p) => p.key === key) || CLOUD_PROVIDERS[0]
 }
+
+// Mirrors server/src/providers/aws/cfnTemplate.js's summarizeAwsPermissions()
+// verbatim — shown as a preview before the customer has even started an AWS
+// connection (so before a real POST /api/customer-aws-accounts response
+// exists to read permissions from). Doesn't depend on any per-customer data,
+// so a static copy here is fine; keep the two lists in sync by hand.
+export const AWS_PERMISSIONS_PREVIEW = [
+  'Push container images to ECR repositories it creates, named cephei-*, and grant Lambda permission to pull from them',
+  'Build container images via CodeBuild (cephei-* projects only) — falls back to a local Docker build only if this AWS account has no CodeBuild quota available',
+  'Create and update Lambda functions, publish versions, and manage the `live` alias (cephei-* function names only)',
+  'Create and manage API Gateway HTTP APIs for deployed functions',
+  'Pass exactly two IAM roles this same stack creates — one to Lambda, one to CodeBuild — nothing else',
+  'Create and update one Secrets Manager secret per app (cephei/cephei-*) to store the environment variables you provide, e.g. your database connection string',
+  'Nothing else — no AdministratorAccess, no ReadOnlyAccess, no RDS, no general S3 access',
+]
